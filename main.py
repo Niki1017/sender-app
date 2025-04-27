@@ -6,13 +6,124 @@ import os
 import sys
 from win10toast import ToastNotifier
 from PIL import Image, ImageTk
+import requests
+import tempfile
+import zipfile
+import shutil
+from packaging import version
+
+
+class Updater:
+    def __init__(self, current_version, repo_url):
+        self.current_version = current_version
+        self.repo_url = repo_url.rstrip('/')
+        self.latest_version = None
+        self.update_url = None
+
+    def check_for_updates(self):
+        try:
+            # Получаем информацию о последнем релизе из GitHub API
+            api_url = f"https://api.github.com/repos/{self.repo_url}/releases/latest"
+            response = requests.get(api_url)
+            response.raise_for_status()
+            
+            release_info = response.json()
+            self.latest_version = release_info['tag_name'].lstrip('v')
+            
+            # Ищем asset с именем AutoSender_Windows.zip
+            for asset in release_info.get('assets', []):
+                if "AutoSender_Windows" in asset['name'] and asset['name'].endswith('.zip'):
+                    self.update_url = asset['browser_download_url']
+                    break
+            
+            if not self.update_url:
+                return False
+                
+            return version.parse(self.latest_version) > version.parse(self.current_version)
+        except Exception as e:
+            print(f"Ошибка при проверке обновлений: {e}")
+            return False
+
+    def download_update(self):
+        try:
+            # Создаем временную директорию
+            temp_dir = tempfile.mkdtemp()
+            zip_path = os.path.join(temp_dir, "update.zip")
+            
+            # Скачиваем архив с обновлением
+            response = requests.get(self.update_url, stream=True)
+            response.raise_for_status()
+            
+            with open(zip_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            
+            return zip_path
+        except Exception as e:
+            print(f"Ошибка при загрузке обновления: {e}")
+            return None
+
+    def apply_update(self, zip_path):
+        try:
+            # Распаковываем архив
+            temp_dir = os.path.dirname(zip_path)
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                zip_ref.extractall(temp_dir)
+            
+            # Находим исполняемый файл обновления
+            for file in os.listdir(temp_dir):
+                if file.endswith('.exe'):
+                    # Заменяем текущий исполняемый файл
+                    current_exe = sys.executable
+                    new_exe = os.path.join(temp_dir, file)
+                    
+                    # В Windows нельзя заменить работающий exe, поэтому используем трюк с bat-файлом
+                    bat_path = os.path.join(os.path.dirname(current_exe), "update.bat")
+                    with open(bat_path, 'w') as bat_file:
+                        bat_file.write(f"""
+                        @echo off
+                        timeout /t 1 /nobreak >nul
+                        del "{current_exe}"
+                        rename "{new_exe}" "{os.path.basename(current_exe)}"
+                        start "" "{current_exe}"
+                        del "{bat_path}"
+                        """)
+                    
+                    os.startfile(bat_path)
+                    sys.exit(0)
+                    return True
+        except Exception as e:
+            print(f"Ошибка при установке обновления: {e}")
+            return False
+        finally:
+            # Удаляем временные файлы
+            try:
+                shutil.rmtree(temp_dir)
+            except:
+                pass
+
+        return False
+
+    def get_version_info(self):
+        """Возвращает строку с информацией о версиях"""
+        if self.latest_version:
+            if version.parse(self.latest_version) > version.parse(self.current_version):
+                return f"Текущая версия: {self.current_version} (доступно обновление до {self.latest_version})"
+            else:
+                return f"Текущая версия: {self.current_version} (актуальная)"
+        return f"Текущая версия: {self.current_version}"
+
 
 class ClaimApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("ProgsLand - Автоматический отправитель команд")
-        self.root.geometry("900x700")
+        self.root.title("AutoSender")
+        self.root.geometry("600x600")
         self.root.resizable(False, False)
+        
+        # Установка текущей версии и репозитория
+        self.current_version = "1.0.0"  # Замените на актуальную версию
+        self.repo_url = "Niki1017/sender-app"  # Замените на ваш репозиторий
         
         # Пути к иконкам
         self.icon_path = self.resource_path("icon.png")
@@ -45,10 +156,13 @@ class ClaimApp:
         
         # Показать уведомление при запуске
         self.show_notification(
-            "ProgsLand запущен", 
+            "AutoSender запущен", 
             "Автоматический отправитель команд готов к работе",
             icon_path=self.notification_icon
         )
+        
+        # Автоматическая проверка обновлений при запуске (через 3 секунды)
+        self.root.after(3000, self.check_updates)
 
     def resource_path(self, relative_path):
         """Получает абсолютный путь к ресурсу для работы с PyInstaller"""
@@ -165,6 +279,19 @@ class ClaimApp:
         )
         self.toggle_button.pack()
         
+        # Кнопка проверки обновлений
+        self.update_button = ctk.CTkButton(
+            self.button_frame,
+            text="Проверить обновления",
+            command=self.check_updates,
+            width=200,
+            height=30,
+            font=("Verdana", 12),
+            fg_color="#1E90FF",
+            hover_color="#4682B4"
+        )
+        self.update_button.pack(pady=10)
+        
         # Таймер
         self.timer_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
         self.timer_frame.pack(pady=10)
@@ -217,6 +344,9 @@ class ClaimApp:
             corner_radius=0
         )
         self.status_bar.pack(fill="x", padx=0, pady=(10, 0))
+        
+        # Обновляем информацию о версии
+        self.update_status_with_version()
 
     def toggle_claim(self):
         """Обрабатывает нажатие кнопки старт/стоп"""
@@ -237,7 +367,7 @@ class ClaimApp:
             self.status_bar.configure(text="Работаю...")
             
             self.show_notification(
-                "ProgsLand - Запущено", 
+                "AutoSender - Запущено", 
                 f"Автоматическая отправка команды '{command}' каждые {interval} секунд",
                 icon_path=self.notification_icon
             )
@@ -251,7 +381,7 @@ class ClaimApp:
             self.update_timer(0)
             
             self.show_notification(
-                "ProgsLand - Остановлено", 
+                "AutoSender - Остановлено", 
                 "Автоматическая отправка команд прекращена",
                 icon_path=self.notification_icon
             )
@@ -263,7 +393,7 @@ class ClaimApp:
         
         # Первое уведомление о подготовке (10 секунд)
         self.show_notification(
-            "ProgsLand - Подготовка", 
+            "AutoSender - Подготовка", 
             f"Начинаем через 10 секунд. Переключитесь в нужное окно.\nКоманда: {command}\nИнтервал: {interval} сек",
             duration=10,
             icon_path=self.notification_icon
@@ -289,7 +419,7 @@ class ClaimApp:
                 # Уведомление об отправке (только для интервалов >= 30 сек)
                 if interval >= 30:
                     self.show_notification(
-                        "ProgsLand - Команда отправлена",
+                        "AutoSender - Команда отправлена",
                         log_msg,
                         duration=5,
                         icon_path=self.notification_icon
@@ -303,7 +433,7 @@ class ClaimApp:
                     # Уведомления за 5 и 1 минуту
                     if i == 300:  # 5 минут
                         self.show_notification(
-                            "ProgsLand - Напоминание",
+                            "AutoSender - Напоминание",
                             f"До следующей отправки осталось 5 минут\nКоманда: {command}",
                             duration=10,
                             icon_path=self.notification_icon
@@ -311,7 +441,7 @@ class ClaimApp:
                         self.log("Уведомление: До следующей отправки 5 минут")
                     elif i == 60:  # 1 минута
                         self.show_notification(
-                            "ProgsLand - Напоминание",
+                            "AutoSender - Напоминание",
                             f"До следующей отправки осталось 1 минута\nКоманда: {command}",
                             duration=10,
                             icon_path=self.notification_icon
@@ -325,7 +455,7 @@ class ClaimApp:
                 error_msg = f"Ошибка: {str(e)}"
                 self.log(error_msg)
                 self.show_notification(
-                    "ProgsLand - Ошибка", 
+                    "AutoSender - Ошибка", 
                     error_msg,
                     icon_path=self.notification_icon
                 )
@@ -358,12 +488,86 @@ class ClaimApp:
     def show_error(self, title, message):
         """Показывает сообщение об ошибке"""
         self.log(f"ОШИБКА: {message}")
-        ctk.CTkMessagebox(
+        msg = ctk.CTkMessagebox(
             title=title,
             message=message,
             icon="cancel",
             corner_radius=10
         )
+        return msg
+
+    def check_updates(self):
+        """Проверяет наличие обновлений и предлагает их установить"""
+        self.log("Проверка обновлений...")
+        updater = Updater(current_version=self.current_version, repo_url=self.repo_url)
+        
+        try:
+            if updater.check_for_updates():
+                self.log(f"Доступна новая версия: {updater.latest_version}")
+                
+                # Спросим пользователя, хочет ли он обновиться
+                dialog = ctk.CTkMessagebox(
+                    title="Доступно обновление",
+                    message=f"Доступна версия {updater.latest_version}. Установить сейчас?",
+                    option_1="Да",
+                    option_2="Нет",
+                    icon="question"
+                )
+                
+                if dialog.get() == "Да":
+                    self.log("Загрузка обновления...")
+                    zip_path = updater.download_update()
+                    
+                    if zip_path:
+                        self.log("Установка обновления...")
+                        if updater.apply_update(zip_path):
+                            self.log("Обновление успешно установлено. Приложение будет закрыто.")
+                            self.show_notification(
+                                "Обновление установлено",
+                                "Приложение будет перезапущено с новой версией",
+                                icon_path=self.notification_icon
+                            )
+                            time.sleep(2)
+                            self.root.destroy()
+                        else:
+                            self.log("Ошибка при установке обновления")
+                            self.show_notification(
+                                "Ошибка обновления",
+                                "Не удалось установить обновление",
+                                icon_path=self.notification_icon
+                            )
+                    else:
+                        self.log("Ошибка при загрузке обновления")
+                        self.show_notification(
+                            "Ошибка загрузки",
+                            "Не удалось загрузить обновление",
+                            icon_path=self.notification_icon
+                        )
+                else:
+                    self.log("Пользователь отказался от обновления")
+            else:
+                self.log("У вас актуальная версия программы")
+                self.show_notification(
+                    "Обновлений нет",
+                    "У вас установлена последняя версия программы",
+                    icon_path=self.notification_icon
+                )
+        except Exception as e:
+            self.log(f"Ошибка при проверке обновлений: {str(e)}")
+            self.show_notification(
+                "Ошибка проверки обновлений",
+                f"Не удалось проверить обновления: {str(e)}",
+                icon_path=self.notification_icon
+            )
+        
+        # Обновляем информацию о версии в статус баре
+        self.update_status_with_version()
+
+    def update_status_with_version(self):
+        """Обновляет статус бар с информацией о версии"""
+        updater = Updater(current_version=self.current_version, repo_url=self.repo_url)
+        self.status_bar.configure(text=f"Готов к работе | {updater.get_version_info()}")
+
 
 if __name__ == "__main__":
     root = ctk.CTk()
